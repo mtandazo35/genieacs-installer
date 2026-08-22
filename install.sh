@@ -79,8 +79,7 @@ install_mongodb() {
     # Codenames con repo oficial de MongoDB; el resto cae al mas cercano
     local repo_os="$OS_ID" repo_code="$CODENAME"
     case "$CODENAME" in
-        bookworm|jammy|noble) ;;
-        trixie) repo_code="bookworm"; warn "Debian 13: usando repo MongoDB de bookworm" ;;
+        bookworm|trixie|jammy|noble) ;;
         *) if [ "$OS_ID" = "debian" ]; then repo_code="bookworm"; else repo_code="noble"; fi
            warn "Codename '$CODENAME' sin repo oficial; usando $repo_code" ;;
     esac
@@ -244,12 +243,18 @@ uninstall_genieacs() {
 # Menu
 #---------------------------------------------------------------
 banner
-echo "  1) Instalar GenieACS"
-echo "  2) Desinstalar"
-echo "  3) Salir"
-echo ""
-read -rp "Opcion [1]: " opcion < /dev/tty
-opcion=${opcion:-1}
+case "${1:-}" in
+    install|--install)     opcion=1 ;;
+    uninstall|--uninstall) opcion=2 ;;
+    *)
+        echo "  1) Instalar GenieACS"
+        echo "  2) Desinstalar"
+        echo "  3) Salir"
+        echo ""
+        read -rp "Opcion [1]: " opcion < /dev/tty
+        opcion=${opcion:-1}
+        ;;
+esac
 
 case "$opcion" in
     1)

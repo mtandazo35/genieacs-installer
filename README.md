@@ -50,6 +50,13 @@ Si UFW está activo abre **7547** y **3000**. Los puertos 7557 (NBI) y 7567 (FS)
 
 El consumidor real de RAM es MongoDB; la carga la define el *inform interval* (15–60 min recomendado en ISP), no el número de equipos.
 
+## Uso no interactivo
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/mtandazo35/genieacs-installer/main/install.sh -o /root/install.sh
+bash /root/install.sh install     # o: uninstall
+```
+
 ## Desinstalar
 
 Ejecutar el instalador de nuevo y elegir la opción **2** (pregunta si borrar también MongoDB y los datos).
