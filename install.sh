@@ -76,10 +76,13 @@ install_mongodb() {
     fi
     echo "Instalando MongoDB ${MONGO_VERSION}..."
 
-    # Codenames con repo oficial de MongoDB; el resto cae al mas cercano
+    # Codenames con repo oficial de MongoDB; el resto cae al mas cercano.
+    # Debian 13: el repo 'trixie' existe pero esta VACIO (verificado 2026-08-22),
+    # los paquetes de bookworm instalan sin problema sobre trixie.
     local repo_os="$OS_ID" repo_code="$CODENAME"
     case "$CODENAME" in
-        bookworm|trixie|jammy|noble) ;;
+        bookworm|jammy|noble) ;;
+        trixie) repo_code="bookworm" ;;
         *) if [ "$OS_ID" = "debian" ]; then repo_code="bookworm"; else repo_code="noble"; fi
            warn "Codename '$CODENAME' sin repo oficial; usando $repo_code" ;;
     esac
