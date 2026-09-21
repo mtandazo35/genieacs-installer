@@ -299,6 +299,7 @@ EOF
     maxsize 100M
     compress
     delaycompress
+    copytruncate
     dateext
     missingok
     notifempty
@@ -627,7 +628,9 @@ do_install() {
     log_init
     check_system
     run apt-get update
-    run apt-get install -y curl gnupg openssl
+    # logrotate: en algunas imagenes minimas (Debian cloud) NO viene; sin el, la
+    # config de /etc/logrotate.d/genieacs no rota nada y los access logs crecen.
+    run apt-get install -y curl gnupg openssl logrotate
     install_node
     install_mongodb
     install_genieacs
