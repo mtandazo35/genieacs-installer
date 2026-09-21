@@ -28,7 +28,27 @@ bash <(curl -fsSL https://raw.githubusercontent.com/mtandazo35/genieacs-installe
 
 Además: usuario de sistema `genieacs`, config en `/opt/genieacs/genieacs.env` (JWT secret autogenerado, `chmod 600`), directorio de extensiones `/opt/genieacs/ext`, logs en `/var/log/genieacs` con logrotate (30 días, maxsize 100M).
 
+Las 4 unidades systemd llevan **hardening prudente** (`NoNewPrivileges`, `PrivateTmp`, `ProtectHome`, `UMask=0077`, `LimitNOFILE`), sin `ProtectSystem=strict` para no romper extensiones/logs.
+
 Si UFW está activo abre **7547** y **3000**. Los puertos 7557 (NBI) y 7567 (FS) no se abren: expónlos solo a IPs de confianza.
+
+### Respaldo automático
+
+El instalador deja un **respaldo diario** de la base (`mongodump` comprimido) vía timer systemd `genieacs-backup.timer` (03:30), en `/root/backups/genieacs/`, conservando los últimos 14. El respaldo vive en la misma VM: **cópialo a un NAS/almacenamiento externo**. Para uno inmediato:
+
+```bash
+bash install.sh backup
+```
+
+Al terminar la instalación se imprime una **auditoría PASS/WARN/FAIL** (versiones, bind de MongoDB, usuario no-root, JWT, permisos, logrotate, respaldo, exposición de red).
+
+### Modo endurecido `--prod` (opcional)
+
+Por defecto UI/NBI/FS escuchan en `0.0.0.0` (cómodo en red de gestión local). Con `--prod` se ligan a `127.0.0.1` (`GENIEACS_*_INTERFACE`) para publicarlos detrás de un reverse proxy con TLS; CWMP :7547 sigue expuesto para los CPEs:
+
+```bash
+bash install.sh install --prod
+```
 
 ## Post-instalación
 
@@ -54,7 +74,9 @@ El consumidor real de RAM es MongoDB; la carga la define el *inform interval* (1
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/mtandazo35/genieacs-installer/main/install.sh -o /root/install.sh
-bash /root/install.sh install     # o: uninstall
+bash /root/install.sh install            # instalar (o: install --prod)
+bash /root/install.sh backup             # respaldo inmediato
+bash /root/install.sh uninstall          # desinstalar
 ```
 
 ## Desinstalar
