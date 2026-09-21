@@ -44,10 +44,22 @@ Al terminar la instalación se imprime una **auditoría PASS/WARN/FAIL** (versio
 
 ### Modo endurecido `--prod` (opcional)
 
-Por defecto UI/NBI/FS escuchan en `0.0.0.0` (cómodo en red de gestión local). Con `--prod` se ligan a `127.0.0.1` (`GENIEACS_*_INTERFACE`) para publicarlos detrás de un reverse proxy con TLS; CWMP :7547 sigue expuesto para los CPEs:
+Por defecto UI/NBI/FS escuchan en `0.0.0.0` (cómodo en red de gestión local). Con `--prod` la UI se liga a `127.0.0.1` y se publica detrás de **nginx con TLS** (certificado self-signed, o Let's Encrypt con `--domain` + `--letsencrypt`); CWMP :7547 sigue expuesto para los CPEs:
 
 ```bash
-bash install.sh install --prod
+bash install.sh install --prod --domain acs.midominio.com --letsencrypt
+```
+
+Flags relacionados: `--nbi-local` y `--fs-local` ligan también NBI/FS a localhost (ojo: `--nbi-local` rompe el acceso de un billing/API externo que consuma la NBI por red). `--workers <n>` fija procesos por servicio (por defecto 2 en VMs con <4 GB). `--backup-remote <dest>` copia cada respaldo a un NAS por rsync/scp.
+
+### Otras acciones
+
+```bash
+bash install.sh status              # auditoría PASS/WARN/FAIL + conteos de Mongo
+bash install.sh backup              # respaldo inmediato
+bash install.sh restore <archivo>   # restaura (mongorestore --drop, pide confirmación)
+bash install.sh update              # sube GenieACS a la versión pineada (respalda + reinicia)
+bash install.sh --help              # ayuda completa
 ```
 
 ## Post-instalación
@@ -75,9 +87,14 @@ El consumidor real de RAM es MongoDB; la carga la define el *inform interval* (1
 ```bash
 curl -fsSL https://raw.githubusercontent.com/mtandazo35/genieacs-installer/main/install.sh -o /root/install.sh
 bash /root/install.sh install            # instalar (o: install --prod)
+bash /root/install.sh status             # auditoría del estado
 bash /root/install.sh backup             # respaldo inmediato
+bash /root/install.sh restore <archivo>  # restaurar un respaldo
+bash /root/install.sh update             # actualizar GenieACS
 bash /root/install.sh uninstall          # desinstalar
 ```
+
+Cada push corre `bash -n` + `shellcheck` en GitHub Actions (`.github/workflows/ci.yml`).
 
 ## Desinstalar
 
