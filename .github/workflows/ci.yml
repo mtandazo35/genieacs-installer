@@ -11,9 +11,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: bash -n (sintaxis)
-        run: bash -n install.sh
+        run: bash -n install.sh tests/regression.sh
       - name: shellcheck
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y shellcheck
-          shellcheck --severity=warning install.sh
+          shellcheck --severity=warning install.sh tests/regression.sh
+      - name: tests de regresion
+        run: bash tests/regression.sh

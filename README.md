@@ -2,7 +2,9 @@
 
 Instalador de [GenieACS](https://genieacs.com/) — ACS **TR-069 (CWMP)** open source para gestión remota de CPEs/ONUs (routers, fibra, DSL, LTE, VoIP).
 
-Instala y deja en marcha la versión estable **1.2.16** con Node.js 20, MongoDB 8.0 y los 4 servicios como unidades systemd.
+Instala y deja en marcha la versión estable **1.2.16** con Node.js 22 (LTS), MongoDB 8.0 y los 4 servicios como unidades systemd.
+
+> **v2.1.0** — correcciones de correctitud tras auditoría externa: `update` exige respaldo utilizable antes de mutar; los flags (`--prod`, `--workers`…) ahora se aplican también sobre una instalación existente (`.env` idempotente); `status` devuelve código ≠0 ante fallos reales y endurece sus chequeos (JWT no vacío, bind anclado, `bindIp` solo-loopback); validación estricta de argumentos; el respaldo incluye un *bundle* de recuperación (`.env`, extensiones, units, TLS) además del dump; la purga de desinstalación ya no borra bases ajenas. Suite de regresión en `tests/regression.sh` (corre en CI).
 
 ## ⚡ Quick install (one-liner)
 

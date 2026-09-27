@@ -10,11 +10,12 @@
 set -o pipefail
 
 GENIEACS_VERSION="1.2.16"
-INSTALLER_VERSION="2.0.0"
-NODE_MAJOR="20"
+INSTALLER_VERSION="2.1.0"
+NODE_MAJOR="22"               # LTS; Node 20 quedo EOL (abril 2026)
 NODE_MIN="18"                 # minimo compatible con GenieACS 1.2.x
 MONGO_VERSION="8.0"
 MONGO_MAJOR="${MONGO_VERSION%%.*}"
+ENV_CHANGED=0                 # lo marca reconcile_env si toca el .env
 
 ENV_FILE="/opt/genieacs/genieacs.env"
 EXT_DIR="/opt/genieacs/ext"
@@ -24,6 +25,7 @@ BACKUP_DIR="/root/backups/genieacs"
 BACKUP_BIN="/usr/local/sbin/genieacs-backup.sh"
 BACKUP_KEEP=14
 TLS_DIR="/etc/genieacs/tls"
+MONGOD_CONF="${MONGOD_CONF:-/etc/mongod.conf}"   # variable para poder testearlo
 
 # --- flags (defaults) ---
 PROD_MODE=0            # --prod: liga UI a localhost + reverse proxy TLS
@@ -164,6 +166,16 @@ install_mongodb() {
         fi
         return
     fi
+    # ACS-13: instalado pero DETENIDO no es lo mismo que no instalado. No corras
+    # la instalacion de otro major sobre datos existentes: arranca el que hay.
+    if command -v mongod >/dev/null 2>&1 || dpkg -l 'mongodb*' 2>/dev/null | grep -q '^ii'; then
+        local ver; ver=$(mongod --version 2>/dev/null | awk '/db version/ {print $3}')
+        warn "MongoDB (${ver:-desconocido}) instalado pero detenido; intento arrancarlo (NO reinstalo)"
+        run systemctl enable --now mongod
+        systemctl is-active --quiet mongod \
+            && { msg "MongoDB arrancado"; return; } \
+            || err "MongoDB instalado pero no arranca; diagnostica (journalctl -u mongod). No se instala otro major encima."
+    fi
     echo "Instalando MongoDB ${MONGO_VERSION}..."
 
     # Codenames con repo oficial de MongoDB; el resto cae al mas cercano.
@@ -214,6 +226,40 @@ compute_workers() {
     if [ "$ram" -lt 4000 ]; then echo 2; else echo ""; fi
 }
 
+# --- .env idempotente: el instalador "posee" solo estas claves y las reconcilia
+#     en cada corrida, para que reinstalar con flags SI cambie el archivo (ACS-06).
+env_set() {   # key value  -> agrega o reemplaza, marca ENV_CHANGED si cambia
+    local key="$1" val="$2"
+    [ -f "$ENV_FILE" ] || return 1
+    if grep -q "^${key}=" "$ENV_FILE"; then
+        grep -qx "${key}=${val}" "$ENV_FILE" && return 0
+        sed -i "s|^${key}=.*|${key}=${val}|" "$ENV_FILE"
+    else
+        echo "${key}=${val}" >> "$ENV_FILE"
+    fi
+    ENV_CHANGED=1
+}
+env_del() {   # key  -> borra si existe
+    [ -f "$ENV_FILE" ] || return 0
+    grep -q "^${1}=" "$ENV_FILE" || return 0
+    sed -i "/^${1}=/d" "$ENV_FILE"
+    ENV_CHANGED=1
+}
+# Reconcilia las claves gestionadas al estado que piden los flags (set si aplica,
+# del si no). No toca JWT/logs/ext/NODE_OPTIONS ni claves ajenas.
+reconcile_env() {
+    local workers s
+    workers=$(compute_workers)
+    for s in CWMP NBI FS UI; do
+        if [ -n "$workers" ]; then env_set "GENIEACS_${s}_WORKER_PROCESSES" "$workers"
+        else env_del "GENIEACS_${s}_WORKER_PROCESSES"; fi
+    done
+    if [ "$PROD_MODE" = "1" ]; then env_set GENIEACS_UI_INTERFACE 127.0.0.1; else env_del GENIEACS_UI_INTERFACE; fi
+    if [ "$NBI_LOCAL" = "1" ]; then env_set GENIEACS_NBI_INTERFACE 127.0.0.1; else env_del GENIEACS_NBI_INTERFACE; fi
+    if [ "$FS_LOCAL" = "1" ]; then env_set GENIEACS_FS_INTERFACE 127.0.0.1; else env_del GENIEACS_FS_INTERFACE; fi
+    if [ "$FS_LOCAL" = "1" ] && [ -n "$DOMAIN" ]; then env_set GENIEACS_FS_URL_PREFIX "https://${DOMAIN}/fs/"; else env_del GENIEACS_FS_URL_PREFIX; fi
+}
+
 install_genieacs() {
     echo "Instalando GenieACS ${GENIEACS_VERSION} via npm..."
     run npm install -g "genieacs@${GENIEACS_VERSION}" || err "Fallo npm install genieacs"
@@ -225,9 +271,8 @@ install_genieacs() {
     chown genieacs:genieacs "$EXT_DIR" "$LOG_DIR"
 
     if [ ! -f "$ENV_FILE" ]; then
-        local jwt workers
+        local jwt
         jwt=$(node -e "console.log(require('crypto').randomBytes(64).toString('hex'))")
-        workers=$(compute_workers)
         {
             echo "GENIEACS_CWMP_ACCESS_LOG_FILE=${LOG_DIR}/genieacs-cwmp-access.log"
             echo "GENIEACS_NBI_ACCESS_LOG_FILE=${LOG_DIR}/genieacs-nbi-access.log"
@@ -236,23 +281,17 @@ install_genieacs() {
             echo "NODE_OPTIONS=--enable-source-maps"
             echo "GENIEACS_EXT_DIR=${EXT_DIR}"
             echo "GENIEACS_UI_JWT_SECRET=${jwt}"
-            if [ -n "$workers" ]; then
-                local s
-                for s in CWMP NBI FS UI; do echo "GENIEACS_${s}_WORKER_PROCESSES=${workers}"; done
-            fi
-            [ "$PROD_MODE" = "1" ] && echo "GENIEACS_UI_INTERFACE=127.0.0.1"
-            [ "$NBI_LOCAL" = "1" ] && echo "GENIEACS_NBI_INTERFACE=127.0.0.1"
-            [ "$FS_LOCAL" = "1" ]  && echo "GENIEACS_FS_INTERFACE=127.0.0.1"
         } > "$ENV_FILE"
         chown genieacs:genieacs "$ENV_FILE"
         chmod 600 "$ENV_FILE"
         msg "Config creada en $ENV_FILE (JWT secret generado)"
-        [ -n "$workers" ] && msg "Workers por servicio: ${workers} (VM con poca RAM)"
-        [ "$PROD_MODE" = "1" ] && msg "Modo --prod: UI ligada a 127.0.0.1"
     else
-        msg "Config existente en $ENV_FILE (se conserva)"
-        [ "$PROD_MODE" = "1" ] && warn "El env ya existia: revisa manualmente GENIEACS_UI_INTERFACE=127.0.0.1 para --prod"
+        msg "Config existente en $ENV_FILE (se conserva JWT y claves ajenas)"
     fi
+    # Reconciliar SIEMPRE las claves gestionadas por flags (idempotente).
+    reconcile_env
+    chown genieacs:genieacs "$ENV_FILE"; chmod 600 "$ENV_FILE"
+    [ "$ENV_CHANGED" = "1" ] && msg "Config de interfaces/workers ajustada a los flags actuales"
 }
 
 create_services() {
@@ -310,9 +349,9 @@ EOF
     for svc in cwmp nbi fs ui; do
         systemctl enable --now "genieacs-${svc}" >>"$INSTALL_LOG" 2>&1
     done
-    # Si el unit cambio y el servicio ya estaba activo, hay que reiniciar para
-    # que tome la nueva definicion (enable --now NO reinicia lo ya activo).
-    if [ "$changed" = "1" ]; then
+    # Si el unit o el .env cambiaron y el servicio ya estaba activo, reiniciar
+    # para que tomen la nueva definicion (enable --now NO reinicia lo ya activo).
+    if [ "$changed" = "1" ] || [ "$ENV_CHANGED" = "1" ]; then
         for svc in cwmp nbi fs ui; do
             systemctl restart "genieacs-${svc}" >>"$INSTALL_LOG" 2>&1
         done
@@ -330,28 +369,51 @@ EOF
 #---------------------------------------------------------------
 setup_backup() {
     ensure_db_tools
+    # ACS-18: preservar el destino remoto si se reinstala sin --backup-remote.
+    if [ -z "$BACKUP_REMOTE" ] && [ -f "$BACKUP_BIN" ]; then
+        BACKUP_REMOTE=$(sed -n 's/^REMOTE="\(.*\)"$/\1/p' "$BACKUP_BIN" 2>/dev/null | head -1)
+        [ -n "$BACKUP_REMOTE" ] && warn "Conservando destino de copia remota previo: $BACKUP_REMOTE"
+    fi
     cat > "$BACKUP_BIN" <<EOF
 #!/bin/bash
-# Respaldo de la base GenieACS (mongodump comprimido). Generado por el instalador.
+# Respaldo de GenieACS (dump Mongo + bundle de config). Generado por el instalador.
 set -u
 DIR="${BACKUP_DIR}"
 KEEP=${BACKUP_KEEP}
 REMOTE="${BACKUP_REMOTE}"
+ENV_FILE="${ENV_FILE}"
+EXT_DIR="${EXT_DIR}"
+TLS_DIR="${TLS_DIR}"
 mkdir -p "\$DIR"
-OUT="\$DIR/genieacs-\$(date +%F-%H%M).archive.gz"
-if mongodump --db genieacs --gzip --archive="\$OUT" >/dev/null 2>&1; then
-    echo "\$(date '+%F %T') backup OK: \$OUT (\$(du -h "\$OUT" | cut -f1))"
+STAMP=\$(date +%F-%H%M%S)
+OUT="\$DIR/genieacs-\$STAMP.archive.gz"
+FILES="\$DIR/genieacs-\$STAMP-files.tar.gz"
+rc=0
+# --- dump Mongo (escritura atomica: .tmp -> mv al terminar) ---
+if mongodump --db genieacs --gzip --archive="\$OUT.tmp" >/dev/null 2>&1; then
+    mv -f "\$OUT.tmp" "\$OUT"
+    echo "\$(date '+%F %T') backup DB OK: \$OUT (\$(du -h "\$OUT" | cut -f1))"
 else
-    echo "\$(date '+%F %T') backup FALLO" >&2; exit 1
+    rm -f "\$OUT.tmp"
+    echo "\$(date '+%F %T') backup DB FALLO" >&2; exit 1
 fi
-# copia off-box opcional
+# --- ACS-19: bundle de recuperacion (env, extensiones, units, TLS, logrotate) ---
+tar -czf "\$FILES.tmp" \
+    "\$ENV_FILE" "\$EXT_DIR" "\$TLS_DIR" \
+    /etc/systemd/system/genieacs-*.service /etc/systemd/system/genieacs-backup.* \
+    /etc/logrotate.d/genieacs 2>/dev/null && mv -f "\$FILES.tmp" "\$FILES" || rm -f "\$FILES.tmp"
+# --- copia off-box opcional (ACS-18: su fallo deja estado degradado, exit 2) ---
 if [ -n "\$REMOTE" ]; then
-    rsync -a "\$OUT" "\$REMOTE"/ 2>/dev/null \
-        || scp -q "\$OUT" "\$REMOTE" 2>/dev/null \
-        || echo "\$(date '+%F %T') copia remota FALLO (\$REMOTE)" >&2
+    if rsync -a "\$OUT" "\$FILES" "\$REMOTE"/ 2>/dev/null || scp -q "\$OUT" "\$FILES" "\$REMOTE" 2>/dev/null; then
+        echo "\$(date '+%F %T') copia remota OK -> \$REMOTE"
+    else
+        echo "\$(date '+%F %T') copia remota FALLO (\$REMOTE); el dump local SI existe" >&2; rc=2
+    fi
 fi
-# retencion: conservar los ultimos \$KEEP locales
+# retencion: conservar los ultimos \$KEEP locales (dumps y bundles)
 ls -1t "\$DIR"/genieacs-*.archive.gz 2>/dev/null | tail -n +\$((KEEP+1)) | xargs -r rm -f
+ls -1t "\$DIR"/genieacs-*-files.tar.gz 2>/dev/null | tail -n +\$((KEEP+1)) | xargs -r rm -f
+exit \$rc
 EOF
     chmod 700 "$BACKUP_BIN"
 
@@ -388,16 +450,26 @@ setup_reverse_proxy() {
     local server_name="${DOMAIN:-$(detect_ip)}"
     command -v nginx >/dev/null 2>&1 || { echo "Instalando nginx..."; run apt-get install -y nginx; }
 
-    if [ "$USE_LE" = "1" ] && [ -n "$DOMAIN" ]; then
-        run apt-get install -y certbot python3-certbot-nginx
+    # ACS-15: si ya hay un cert Let's Encrypt emitido para el dominio, usarlo y
+    # NO pisarlo con el self-signed al reinstalar.
+    local crt key le_live="/etc/letsencrypt/live/${DOMAIN}"
+    if [ -n "$DOMAIN" ] && [ -f "${le_live}/fullchain.pem" ]; then
+        crt="${le_live}/fullchain.pem"; key="${le_live}/privkey.pem"
+        msg "Usando certificado Let's Encrypt existente para ${DOMAIN}"
+    else
+        mkdir -p "$TLS_DIR"
+        if [ ! -f "$TLS_DIR/acs.crt" ]; then
+            run openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
+                -keyout "$TLS_DIR/acs.key" -out "$TLS_DIR/acs.crt" -subj "/CN=${server_name}"
+            chmod 600 "$TLS_DIR/acs.key"
+        fi
+        crt="$TLS_DIR/acs.crt"; key="$TLS_DIR/acs.key"
     fi
 
-    mkdir -p "$TLS_DIR"
-    if [ ! -f "$TLS_DIR/acs.crt" ]; then
-        run openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
-            -keyout "$TLS_DIR/acs.key" -out "$TLS_DIR/acs.crt" \
-            -subj "/CN=${server_name}"
-        chmod 600 "$TLS_DIR/acs.key"
+    # ACS-16: FS local necesita publicarse; si --fs-local se agrega location /fs/.
+    local fs_block=""
+    if [ "$FS_LOCAL" = "1" ]; then
+        fs_block=$'    location /fs/ {\n        proxy_pass http://127.0.0.1:7567/;\n        proxy_set_header Host $host;\n        client_max_body_size 512m;\n    }\n'
     fi
 
     cat > /etc/nginx/sites-available/genieacs <<EOF
@@ -410,11 +482,14 @@ server {
     listen 443 ssl;
     server_name ${server_name};
 
-    ssl_certificate     ${TLS_DIR}/acs.crt;
-    ssl_certificate_key ${TLS_DIR}/acs.key;
+    ssl_certificate     ${crt};
+    ssl_certificate_key ${key};
     ssl_protocols TLSv1.2 TLSv1.3;
 
-    location / {
+    # ACS-17: firmwares grandes por la UI (por defecto nginx corta en 1 MiB).
+    client_max_body_size 512m;
+
+${fs_block}    location / {
         proxy_pass http://127.0.0.1:3000;
         proxy_http_version 1.1;
         proxy_set_header Host \$host;
@@ -429,10 +504,22 @@ EOF
     if nginx -t >>"$INSTALL_LOG" 2>&1; then
         run systemctl reload nginx
         msg "Reverse proxy TLS en https://${server_name} -> UI 127.0.0.1:3000"
-        [ "$USE_LE" = "1" ] && [ -n "$DOMAIN" ] && \
-            warn "Para cert Let's Encrypt real: certbot --nginx -d ${DOMAIN}"
     else
         warn "nginx -t fallo; revisa /etc/nginx/sites-available/genieacs y $INSTALL_LOG"
+        return
+    fi
+
+    # ACS-15: emitir el cert real (no solo instalar certbot). Requiere que el
+    # dominio resuelva a esta maquina y el :80 sea alcanzable (no aplica en LAN).
+    if [ "$USE_LE" = "1" ] && [ -n "$DOMAIN" ]; then
+        run apt-get install -y certbot python3-certbot-nginx
+        if certbot --nginx -d "$DOMAIN" --non-interactive --agree-tos --register-unsafely-without-email --redirect >>"$INSTALL_LOG" 2>&1; then
+            msg "Let's Encrypt: certificado emitido y renovacion automatica activa para ${DOMAIN}"
+        else
+            warn "Let's Encrypt NO pudo emitir (dominio no resoluble o :80 inalcanzable, tipico en LAN); queda el certificado self-signed"
+        fi
+    elif [ "$USE_LE" = "1" ]; then
+        warn "--letsencrypt requiere --domain; queda self-signed"
     fi
 }
 
@@ -454,8 +541,20 @@ configure_firewall() {
 #---------------------------------------------------------------
 # Auditoria PASS/WARN/FAIL (reusable: install.sh status)
 #---------------------------------------------------------------
+# Devuelve 0 si el bindIp de mongod es SOLO loopback (127.0.0.1/::1), 1 si no.
+mongo_bind_localhost_only() {
+    local bip
+    bip=$(grep -E "^\s*bindIp:" "$MONGOD_CONF" 2>/dev/null | head -1 | sed 's/.*bindIp:[[:space:]]*//; s/#.*//; s/[[:space:]]//g')
+    [ -n "$bip" ] || return 1
+    # si hay algun token que NO sea loopback -> NO es solo-localhost (return 1)
+    if echo "$bip" | tr ',' '\n' | grep -qvE '^(127\.0\.0\.1|::1)$'; then
+        return 1
+    fi
+    return 0
+}
+
 do_status() {
-    local p="${G}[PASS]${N}" w="${Y}[WARN]${N}" f="${R}[FAIL]${N}"
+    local p="${G}[PASS]${N}" w="${Y}[WARN]${N}" f="${R}[FAIL]${N}" fails=0
     echo -e "${C}--------- ESTADO GenieACS ---------${N}"
 
     # OJO: `genieacs-cwmp --version` NO imprime version, ARRANCA el servicio
@@ -464,7 +563,7 @@ do_status() {
         local gver; gver=$(npm ls -g genieacs 2>/dev/null | awk -F@ '/genieacs@/{print $2; exit}')
         echo -e "$p GenieACS instalado (${gver:-version?})"
     else
-        echo -e "$f GenieACS no instalado"
+        echo -e "$f GenieACS no instalado"; fails=$((fails+1))
     fi
 
     local nm; nm=$(node -p "process.versions.node.split('.')[0]" 2>/dev/null)
@@ -477,41 +576,43 @@ do_status() {
         && echo -e "$p MongoDB v${mm}.x" \
         || echo -e "$w MongoDB v${mm:-?}.x (el stack fija ${MONGO_VERSION})"
 
-    if grep -qE "bindIp:\s*127\.0\.0\.1" /etc/mongod.conf 2>/dev/null && ! grep -qE "bindIp:.*0\.0\.0\.0" /etc/mongod.conf 2>/dev/null; then
+    if mongo_bind_localhost_only; then
         echo -e "$p MongoDB escucha solo en localhost"
     else
-        echo -e "$w MongoDB bind: revisar /etc/mongod.conf"
+        echo -e "$w MongoDB bind NO es solo localhost: revisar /etc/mongod.conf"
     fi
 
-    local svc allok=1
+    local svc down=""
     for svc in cwmp nbi fs ui; do
-        systemctl is-active --quiet "genieacs-${svc}" || allok=0
+        systemctl is-active --quiet "genieacs-${svc}" || down="$down $svc"
     done
-    [ "$allok" = "1" ] && echo -e "$p 4 servicios activos" || echo -e "$f Algun servicio genieacs caido (journalctl -u genieacs-*)"
+    if [ -z "$down" ]; then echo -e "$p 4 servicios activos"
+    else echo -e "$f Servicio(s) caido(s):${down} (journalctl -u genieacs-*)"; fails=$((fails+1)); fi
 
-    id genieacs >/dev/null 2>&1 \
-        && echo -e "$p Servicios como usuario genieacs (no-root)" \
-        || echo -e "$f usuario genieacs ausente"
+    if id genieacs >/dev/null 2>&1; then echo -e "$p usuario genieacs (no-root) existe"
+    else echo -e "$f usuario genieacs ausente"; fails=$((fails+1)); fi
 
-    grep -q "GENIEACS_UI_JWT_SECRET=" "$ENV_FILE" 2>/dev/null \
-        && echo -e "$p JWT de UI generado" || echo -e "$w JWT de UI ausente"
+    # JWT debe existir Y tener valor (no vacio ni comentado)
+    grep -qE "^GENIEACS_UI_JWT_SECRET=.+" "$ENV_FILE" 2>/dev/null \
+        && echo -e "$p JWT de UI presente" \
+        || { echo -e "$f JWT de UI ausente o vacio"; fails=$((fails+1)); }
 
     [ "$(stat -c '%a' "$ENV_FILE" 2>/dev/null)" = "600" ] \
-        && echo -e "$p Permisos ${ENV_FILE} = 600" || echo -e "$w Permisos de ${ENV_FILE}"
+        && echo -e "$p Permisos ${ENV_FILE} = 600" || echo -e "$w Permisos de ${ENV_FILE} != 600"
 
-    [ -f /etc/logrotate.d/genieacs ] \
-        && echo -e "$p logrotate configurado" || echo -e "$w logrotate ausente"
+    [ -f /etc/logrotate.d/genieacs ] && command -v logrotate >/dev/null 2>&1 \
+        && echo -e "$p logrotate instalado y configurado" \
+        || echo -e "$w logrotate ausente o sin binario"
 
     systemctl is-enabled --quiet genieacs-backup.timer 2>/dev/null \
         && echo -e "$p Respaldo diario activo (${BACKUP_DIR})" || echo -e "$w Respaldo diario no activo"
 
-    if grep -q "GENIEACS_UI_INTERFACE=127.0.0.1" "$ENV_FILE" 2>/dev/null; then
+    # bind anclado y sin comentar (una linea '#...' NO cuenta como aplicado)
+    if grep -qE "^GENIEACS_UI_INTERFACE=127\.0\.0\.1" "$ENV_FILE" 2>/dev/null; then
         echo -e "$p UI ligada a localhost (reverse proxy)"
     else
-        echo -e "$w UI/NBI/FS escuchan en 0.0.0.0 (ok en red local; usa --prod si se expone)"
+        echo -e "$w UI en 0.0.0.0 (ok en red local; --prod si se expone)"
     fi
-    echo -e "$w CWMP en HTTP sin TLS (ok en red local; TLS si se expone a internet)"
-    echo -e "$w cwmp.auth pendiente: por defecto acepta cualquier CPE (Admin > Config)"
 
     # datos operativos si mongosh esta disponible
     if command -v mongosh >/dev/null 2>&1; then
@@ -521,7 +622,10 @@ do_status() {
         fa=$(mongosh --quiet genieacs --eval 'db.faults.countDocuments({})' 2>/dev/null)
         echo -e "${C}--- Mongo: devices=${d:-?} tasks=${t:-?} faults=${fa:-?} ---${N}"
     fi
-    echo -e "${C}-----------------------------------${N}"
+    if [ "$fails" -eq 0 ]; then
+        echo -e "${C}--- estado: OK (0 FAIL) ---${N}"; return 0
+    fi
+    echo -e "${R}--- estado: ${fails} FAIL ---${N}"; return 1
 }
 
 show_summary() {
@@ -583,15 +687,33 @@ do_update() {
     check_system
     command -v genieacs-cwmp >/dev/null 2>&1 || err "GenieACS no esta instalado; usa 'install' primero"
     log_init
-    warn "Actualizando GenieACS a ${GENIEACS_VERSION}. Se respalda antes."
-    [ -x "$BACKUP_BIN" ] && "$BACKUP_BIN"
-    run npm install -g "genieacs@${GENIEACS_VERSION}" || err "Fallo npm install genieacs"
+    local old_ver
+    old_ver=$(npm ls -g genieacs 2>/dev/null | awk -F@ '/genieacs@/{print $2; exit}')
+    echo "Version actual: ${old_ver:-desconocida}  ->  objetivo: ${GENIEACS_VERSION}"
+
+    # ACS-07: el respaldo es PRECONDICION DURA. Sin respaldo utilizable, no se muta.
+    [ -x "$BACKUP_BIN" ] || err "No hay script de respaldo (${BACKUP_BIN}); reinstala. NO se actualiza sin respaldo."
+    echo "Respaldando antes de actualizar..."
+    "$BACKUP_BIN"; local brc=$?
+    # exit 2 = dump local OK pero copia remota fallo; distinto de dump fallido (1)
+    if [ "$brc" = "2" ]; then
+        warn "Copia remota fallo, pero el dump local existe; continuo"
+    elif [ "$brc" != "0" ]; then
+        err "El respaldo FALLO (rc=$brc); se aborta la actualizacion (no mutar sin respaldo)."
+    fi
+
+    run npm install -g "genieacs@${GENIEACS_VERSION}" || err "Fallo npm install genieacs (sin cambios de servicio; respaldo intacto)"
     local svc
     for svc in cwmp nbi fs ui; do
         systemctl restart "genieacs-${svc}" >>"$INSTALL_LOG" 2>&1
     done
     sleep 2
-    do_status
+    # ACS-07/11: si algo quedo caido, el update NO se declara exitoso.
+    if do_status; then
+        msg "Actualizacion OK (${old_ver:-?} -> ${GENIEACS_VERSION})"
+    else
+        err "Tras actualizar hay servicios caidos. Respaldo en ${BACKUP_DIR} (restore con: install.sh restore <archivo>)."
+    fi
 }
 
 #---------------------------------------------------------------
@@ -615,12 +737,26 @@ uninstall_genieacs() {
     msg "Servicios, timer de respaldo y paquete eliminados"
     warn "Se conservan los respaldos en $BACKUP_DIR (borrar a mano si se quiere)"
 
-    read -rp "Borrar tambien MongoDB, base de datos y /opt/genieacs? [s/N]: " ok < /dev/tty
+    read -rp "Borrar la base 'genieacs' y /opt/genieacs? [s/N]: " ok < /dev/tty
     if [ "$ok" = "s" ] || [ "$ok" = "S" ]; then
-        systemctl disable --now mongod >/dev/null 2>&1
-        apt-get purge -y 'mongodb-org*' >/dev/null 2>&1
-        rm -rf /var/lib/mongodb /etc/apt/sources.list.d/mongodb-org.list /opt/genieacs "$LOG_DIR"
-        msg "MongoDB y datos eliminados"
+        if command -v mongosh >/dev/null 2>&1; then
+            mongosh --quiet --eval 'db.getSiblingDB("genieacs").dropDatabase()' >/dev/null 2>&1 \
+                && msg "Base 'genieacs' eliminada (las demas bases quedan intactas)"
+        fi
+        rm -rf /opt/genieacs "$LOG_DIR"
+        msg "/opt/genieacs y logs eliminados"
+        # ACS-10: la purga del motor borra /var/lib/mongodb = TODAS las bases.
+        # Solo con confirmacion explicita de que el motor es dedicado al ACS.
+        warn "Purgar el motor MongoDB elimina /var/lib/mongodb: TODAS las bases, no solo genieacs."
+        read -rp "Si MongoDB es DEDICADO al ACS, escribe DEDICADO para purgar el motor: " full < /dev/tty
+        if [ "$full" = "DEDICADO" ]; then
+            systemctl disable --now mongod >/dev/null 2>&1
+            apt-get purge -y 'mongodb-org*' >/dev/null 2>&1
+            rm -rf /var/lib/mongodb /etc/apt/sources.list.d/mongodb-org.list
+            msg "Motor MongoDB purgado por completo"
+        else
+            msg "Se conserva el motor MongoDB y las demas bases"
+        fi
     fi
 }
 
@@ -646,6 +782,12 @@ do_install() {
 #---------------------------------------------------------------
 # Parseo de argumentos + dispatch
 #---------------------------------------------------------------
+# need_val: exige que el flag traiga un valor y que ese valor no sea otro flag.
+need_val() { case "${2:-}" in ""|-*) err "La opcion $1 requiere un valor";; esac; }
+
+# main() envuelve todo el flujo para que los tests puedan hacer `source` del
+# script y probar funciones sin dispararlo (guardia BASH_SOURCE al final).
+main() {
 ACTION=""
 RESTORE_FILE=""
 while [ $# -gt 0 ]; do
@@ -653,22 +795,35 @@ while [ $# -gt 0 ]; do
         install|--install)     ACTION="install" ;;
         uninstall|--uninstall) ACTION="uninstall" ;;
         backup|--backup)       ACTION="backup" ;;
-        restore|--restore)     ACTION="restore"; shift; RESTORE_FILE="${1:-}" ;;
         status|--status)       ACTION="status" ;;
         update|--update)       ACTION="update" ;;
+        restore|--restore)
+            ACTION="restore"
+            # el archivo es opcional (sin el, lista los disponibles)
+            if [ -n "${2:-}" ] && [ "${2#-}" = "${2:-}" ]; then RESTORE_FILE="$2"; shift; fi ;;
         --prod)                PROD_MODE=1 ;;
         --nbi-local)           NBI_LOCAL=1 ;;
         --fs-local)            FS_LOCAL=1 ;;
         --letsencrypt|--le)    USE_LE=1 ;;
-        --domain)              shift; DOMAIN="${1:-}" ;;
-        --workers)             shift; WORKERS="${1:-}" ;;
-        --backup-remote)       shift; BACKUP_REMOTE="${1:-}" ;;
+        --domain)              need_val "--domain" "${2:-}"; DOMAIN="$2"; shift ;;
+        --backup-remote)       need_val "--backup-remote" "${2:-}"; BACKUP_REMOTE="$2"; shift ;;
+        --workers)
+            need_val "--workers" "${2:-}"; WORKERS="$2"; shift
+            case "$WORKERS" in ''|*[!0-9]*) err "--workers debe ser un entero (recibido: $WORKERS)";; esac
+            [ "$WORKERS" -ge 1 ] || err "--workers debe ser >= 1" ;;
         -h|--help)             usage; exit 0 ;;
         -v|--version)          echo "installer ${INSTALLER_VERSION} (GenieACS ${GENIEACS_VERSION})"; exit 0 ;;
-        *)                     warn "Opcion desconocida: $1" ;;
+        *)                     err "Opcion/argumento no reconocido: $1 (usa --help)" ;;
     esac
     shift
 done
+
+# Validaciones de combinaciones (ACS-16): FS local necesita proxy + dominio.
+if [ "$FS_LOCAL" = "1" ]; then
+    [ "$PROD_MODE" = "1" ] || err "--fs-local requiere --prod (el FS se publica por el reverse proxy)"
+    [ -n "$DOMAIN" ] || err "--fs-local requiere --domain (para GENIEACS_FS_URL_PREFIX y el proxy /fs/)"
+fi
+[ "$USE_LE" = "1" ] && [ -z "$DOMAIN" ] && err "--letsencrypt requiere --domain"
 
 banner
 
@@ -699,3 +854,10 @@ case "$ACTION" in
     update)    do_update ;;
     *)         usage; exit 1 ;;
 esac
+}
+
+# Solo ejecuta main si el script se corre directamente (no si se hace `source`,
+# como en los tests de regresion).
+if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
+    main "$@"
+fi
